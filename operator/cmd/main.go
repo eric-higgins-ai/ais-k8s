@@ -18,9 +18,11 @@ import (
 	authcontroller "github.com/ais-operator/internal/controller/aisauth"
 	authwebhookv1alpha1 "github.com/ais-operator/internal/webhook/aisauth/v1alpha1"
 	"github.com/ais-operator/pkg/controllers"
+	"github.com/ais-operator/pkg/resources/cmn"
 	"github.com/ais-operator/pkg/services"
 	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -157,12 +159,17 @@ func main() {
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	mgrOptions := ctrl.Options{
-		Client: client.Options{
-			Cache: &client.CacheOptions{
-				// Disabling cache for Pods since `controller-runtime` is implicitly
-				// creating informer for Pods (after first GET/LIST) what in a large
-				// zones causes huge memory usage and may lead to OOM kills.
-				DisableFor: []client.Object{&corev1.Pod{}},
+		// Restrict the pod informer to only AIS pods (via the
+		// app.kubernetes.io/managed-by=ais-operator label) to avoid caching
+		// every pod in the cluster, which caused OOM kills in large zones.
+		// Previously the cache was disabled entirely for pods (DisableFor),
+		// but now that the informer is label-restricted we can safely cache
+		// AIS pods and read them from the cache.
+		Cache: cache.Options{
+			ByObject: map[client.Object]cache.ByObject{
+				&corev1.Pod{}: {
+					Label: labels.SelectorFromSet(labels.Set{cmn.LabelAppPrefixed: cmn.LabelManagedByValue}),
+				},
 			},
 		},
 		Scheme:                 scheme,

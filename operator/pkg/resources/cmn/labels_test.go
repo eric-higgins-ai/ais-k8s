@@ -17,6 +17,7 @@ var _ = Describe("Labels", Label("short"), func() {
 				LabelAppPrefixed:       "ais",
 				LabelComponent:         "proxy",
 				LabelComponentPrefixed: "proxy",
+				LabelManagedBy:         LabelManagedByValue,
 			}))
 		})
 	})

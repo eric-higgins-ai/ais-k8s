@@ -14,6 +14,7 @@ func LegacyLabels(name, component string) map[string]string {
 		LabelAppPrefixed:       name,
 		LabelComponent:         component,
 		LabelComponentPrefixed: component,
+		LabelManagedBy:         LabelManagedByValue,
 	}
 }
 

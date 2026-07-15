@@ -203,23 +203,35 @@ func (r *AIStoreReconciler) determineAutoScaleStatus(ctx context.Context, ais *a
 	logger := logf.FromContext(ctx)
 	autoScaleStatus := aisv1.AutoScaleStatus{}
 	if ais.IsTargetAutoScaling() {
-		targetNodes, err := r.listMatchingNodeNames(ctx, ais.Spec.TargetSpec.NodeSelector, ais.Spec.TargetSpec.Tolerations)
+		schedulableNodes, err := r.listMatchingNodeNames(ctx, ais.Spec.TargetSpec.NodeSelector, ais.Spec.TargetSpec.Tolerations)
 		if err != nil {
 			logger.Error(err, "Unable to fetch nodes for autoScaleStatus target")
 			return err
 		}
-		logger.Info("Discovered autoScaleStatus target nodes", "targetNodes", targetNodes)
-		autoScaleStatus.ExpectedTargetNodes = targetNodes
+		podNodes, err := r.listNodesRunningDaemonPods(ctx, ais, target.SelectorLabels(ais))
+		if err != nil {
+			logger.Error(err, "Unable to fetch nodes running target pods for autoScaleStatus")
+			return err
+		}
+		unionNodes := unionSorted(schedulableNodes, podNodes)
+		logger.Info("Discovered autoScaleStatus target nodes", "schedulableNodes", schedulableNodes, "podNodes", podNodes, "unionNodes", unionNodes)
+		autoScaleStatus.ExpectedTargetNodes = unionNodes
 	}
 
 	if ais.IsProxyAutoScaling() {
-		proxyNodes, err := r.listMatchingNodeNames(ctx, ais.Spec.ProxySpec.NodeSelector, ais.Spec.ProxySpec.Tolerations)
+		schedulableNodes, err := r.listMatchingNodeNames(ctx, ais.Spec.ProxySpec.NodeSelector, ais.Spec.ProxySpec.Tolerations)
 		if err != nil {
 			logger.Error(err, "Unable to fetch nodes for autoScaleStatus proxy")
 			return err
 		}
-		logger.Info("Discovered autoScaleStatus proxy nodes", "proxyNodes", proxyNodes)
-		autoScaleStatus.ExpectedProxyNodes = proxyNodes
+		podNodes, err := r.listNodesRunningDaemonPods(ctx, ais, proxy.SelectorLabels(ais))
+		if err != nil {
+			logger.Error(err, "Unable to fetch nodes running proxy pods for autoScaleStatus")
+			return err
+		}
+		unionNodes := unionSorted(schedulableNodes, podNodes)
+		logger.Info("Discovered autoScaleStatus proxy nodes", "schedulableNodes", schedulableNodes, "podNodes", podNodes, "unionNodes", unionNodes)
+		autoScaleStatus.ExpectedProxyNodes = unionNodes
 	}
 
 	return r.updateAutoScaleStatus(ctx, ais, autoScaleStatus)
@@ -1016,7 +1028,29 @@ func (r *AIStoreReconciler) patchStatus(ctx context.Context, ais *aisv1.AIStore)
 func (r *AIStoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	nodePredicate := predicate.Funcs{
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			return !reflect.DeepEqual(e.ObjectOld.GetLabels(), e.ObjectNew.GetLabels())
+			labelsChanged := !reflect.DeepEqual(e.ObjectOld.GetLabels(), e.ObjectNew.GetLabels())
+			oldNode, ok1 := e.ObjectOld.(*corev1.Node)
+			newNode, ok2 := e.ObjectNew.(*corev1.Node)
+			if !ok1 || !ok2 {
+				return labelsChanged
+			}
+			return labelsChanged || !reflect.DeepEqual(oldNode.Spec.Taints, newNode.Spec.Taints)
+		},
+		CreateFunc: func(_ event.CreateEvent) bool {
+			return true
+		},
+		DeleteFunc: func(_ event.DeleteEvent) bool {
+			return true
+		},
+	}
+	podPredicate := predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldPod, ok1 := e.ObjectOld.(*corev1.Pod)
+			newPod, ok2 := e.ObjectNew.(*corev1.Pod)
+			if !ok1 || !ok2 {
+				return true
+			}
+			return oldPod.Spec.NodeName != newPod.Spec.NodeName
 		},
 		CreateFunc: func(_ event.CreateEvent) bool {
 			return true
@@ -1030,6 +1064,10 @@ func (r *AIStoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Node{},
 			handler.EnqueueRequestsFromMapFunc(r.findAISClustersForNode),
 			builder.WithPredicates(nodePredicate),
+		).
+		Watches(&corev1.Pod{},
+			handler.EnqueueRequestsFromMapFunc(r.findAISClustersForPod),
+			builder.WithPredicates(podPredicate),
 		).
 		Owns(&apiv1.StatefulSet{}).
 		Owns(&corev1.ConfigMap{}).
@@ -1089,6 +1127,25 @@ func (r *AIStoreReconciler) findAISClustersForNode(ctx context.Context, o k8scli
 	}
 
 	return requests
+}
+
+func (r *AIStoreReconciler) findAISClustersForPod(_ context.Context, o k8sclient.Object) []reconcile.Request {
+	logger := r.log.WithName("pod-mapper").WithValues("object", o.GetName())
+
+	pod, ok := o.(*corev1.Pod)
+	if !ok {
+		logger.Error(fmt.Errorf("unexpected object type"), "Expected Pod", "got", fmt.Sprintf("%T", o))
+		return nil
+	}
+
+	aisName := pod.Labels[cmn.LabelAppPrefixed]
+	if aisName == "" {
+		return nil
+	}
+
+	return []reconcile.Request{{
+		NamespacedName: types.NamespacedName{Namespace: pod.Namespace, Name: aisName},
+	}}
 }
 
 func (r *AIStoreReconciler) nodeMatchesForProxy(node *corev1.Node, ais *aisv1.AIStore) bool {
@@ -1153,6 +1210,45 @@ func (r *AIStoreReconciler) listMatchingNodeNames(ctx context.Context, selector 
 	}
 	slices.Sort(names)
 	return names, nil
+}
+
+// listNodesRunningDaemonPods returns the sorted names of nodes that currently
+// have an AIS daemon pod (matching the given labels) scheduled on them.
+func (r *AIStoreReconciler) listNodesRunningDaemonPods(ctx context.Context, ais *aisv1.AIStore, podLabels map[string]string) ([]string, error) {
+	podList, err := r.k8sClient.ListPods(ctx, ais, podLabels)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(podList.Items))
+	for i := range podList.Items {
+		nodeName := podList.Items[i].Spec.NodeName
+		if nodeName != "" {
+			seen[nodeName] = struct{}{}
+		}
+	}
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names, nil
+}
+
+// unionSorted returns the sorted union of two string slices.
+func unionSorted(a, b []string) []string {
+	seen := make(map[string]struct{}, len(a)+len(b))
+	for _, s := range a {
+		seen[s] = struct{}{}
+	}
+	for _, s := range b {
+		seen[s] = struct{}{}
+	}
+	result := make([]string, 0, len(seen))
+	for s := range seen {
+		result = append(result, s)
+	}
+	slices.Sort(result)
+	return result
 }
 
 // nodeAffectsTLSCertificate reports whether a change to node could change the
