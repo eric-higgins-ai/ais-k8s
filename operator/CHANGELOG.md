@@ -14,6 +14,7 @@ We structure this changelog in accordance with [Keep a Changelog](https://keepac
 
 - When autoscaling is enabled, the desired cluster size is now computed based on the union of (nodes where AIStore is currently running) and (nodes where AIStore is schedulable). This fixes an issue where marking a node unschedulable but not evicting the AIStore pods on it would cause the cluster to scale 
 down unnecessarily. Note that this will only take effect once a rollout to proxy and target statefulsets happens.
+- Detect the case where a proxy rollout is stuck due to an unschedulable pod and proxy scaling is needed, and perform the scaling before continuing with the rollout.
 
 ---
 
